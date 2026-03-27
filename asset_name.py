@@ -14,14 +14,16 @@ COLUNA_SWAP = "AN"         # Coluna em MARS usada como chave para Swap
 # TIPOS DE PRODUTO — edite aqui se surgir novo nome de produto
 # =============================================================================
 
-# Passam pelo tratamento FTS (Rating Description → Trade ID → Asset → fallback)
+# Passa pelo tratamento FTS (Rating Description → Trade ID → Asset → fallback)
 PRODUTOS_OPCAO_TRATAMENTO = frozenset([
     "Opcao",
-    "Option",
 ])
 
 # Seguem direto a coluna Asset, sem busca no FTS
+# Option   → asset + " Equity"
+# demais   → asset
 PRODUTOS_OPCAO_DIRETO = frozenset([
+    "Option",
     "Opção de ações",
     "Opcao de açoes",
 ])
@@ -181,6 +183,10 @@ def traduzir_asset_name(
     """
     produto      = limpar_texto(linha["Product"])
     codigo_base  = montar_codigo_base(linha)
+
+    # --- Option — asset (MARS) + " Equity", sem busca no FTS -----------------
+    if produto == "Option":
+        return limpar_texto(linha["Asset"]) + " Equity"
 
     # --- Opcao de ações / Opcao de açoes — retorna direto a coluna Asset -----
     if produto in PRODUTOS_OPCAO_DIRETO:
