@@ -1,15 +1,46 @@
 import pandas as pd
 import xlwings as xw
 
-# Single source of truth for option product types
-PRODUTOS_OPCAO = frozenset(["Opcao", "Opção de ações", "Opcao de açoes", "Option"])
+# =============================================================================
+# CONFIGURAÇÕES — edite aqui se mudar nomes de abas ou colunas
+# =============================================================================
 
-PRODUTOS_SWAP = frozenset(["Swap", "Swap - Generic"])
+ABA_MARS = "MARS"          # Aba com os dados principais
+ABA_FTS  = "FTS"           # Aba com a tabela de tradução (colunas C, BR, I)
+ABA_AUX  = "AUX"           # Aba auxiliar com mapa de Swap (colunas H e I)
 
+COLUNA_SWAP = "AN"         # Coluna em MARS usada como chave para Swap
+
+# Linha onde começa o cabeçalho em cada aba (1 = primeira linha)
+LINHA_CABECALHO_MARS = 1
+LINHA_CABECALHO_FTS  = 1
+
+# =============================================================================
+# TIPOS DE PRODUTO — edite aqui se surgir novo nome de produto
+# =============================================================================
+
+PRODUTOS_OPCAO = frozenset([
+    "Opcao",
+    "Opção de ações",
+    "Opcao de açoes",
+    "Option",
+])
+
+PRODUTOS_SWAP = frozenset([
+    "Swap",
+    "Swap - Generic",
+])
+
+# Códigos que começam com esses prefixos recebem tratamento especial via FTS
 PREFIXOS_ESPECIAIS = ("OFEQ", "EQC", "EQV", "INDV", "INDC")
 
 
+# =============================================================================
+# FUNÇÕES AUXILIARES
+# =============================================================================
+
 def limpar_texto(valor) -> str:
+    """Remove espaços, &nbsp; e converte para string. Retorna '' se vazio."""
     try:
         if pd.isna(valor):
             return ""
@@ -18,146 +49,225 @@ def limpar_texto(valor) -> str:
     return str(valor).replace("\xa0", " ").strip()
 
 
-def _tem_valor(v) -> bool:
+def tem_valor(v) -> bool:
+    """Retorna True se v não for None nem string vazia."""
     return v is not None and limpar_texto(v) != ""
 
 
 def tratar_trade_id(valor) -> str:
+    """Extrai a parte antes do primeiro '-' no Trade ID."""
     valor = limpar_texto(valor)
     if "-" in valor:
         return valor.split("-")[0].strip()
     return valor
 
 
-def montar_codigo_base(linha) -> str:
-    produto = limpar_texto(linha["Product"])
-    asset = limpar_texto(linha["Asset"])
+# =============================================================================
+# LEITURA DOS DADOS DO EXCEL
+# =============================================================================
 
-    if produto == "Ações":
-        return asset + " BZ EQUITY"
-    elif produto == "Equity":
-        return asset + " EQUITY"
-    elif produto in PRODUTOS_OPCAO:
-        return asset if produto != "Option" else asset + " Equity"
-
-    return asset
-
-
-def comeca_com_prefixo_especial(codigo: str) -> bool:
-    return limpar_texto(codigo).startswith(PREFIXOS_ESPECIAIS)
-
-
-def criar_mapas_fts(df_fts: pd.DataFrame):
-    fts_c_para_i = (
-        df_fts.dropna(subset=["C"])
-        .assign(C_limpo=lambda x: x["C"].astype(str).str.replace("\xa0", " ", regex=False).str.strip())
-        .drop_duplicates(subset=["C_limpo"])
-        .set_index("C_limpo")["I"]
-        .to_dict()
+def ler_dataframe_da_aba(aba) -> pd.DataFrame:
+    """Lê a aba inteira como DataFrame (cabeçalho na primeira linha)."""
+    return (
+        aba
+        .range("A1")
+        .options(pd.DataFrame, expand="table", header=1)
+        .value
     )
 
-    fts_br_para_i = (
-        df_fts.dropna(subset=["BR"])
-        .assign(BR_limpo=lambda x: x["BR"].astype(str).str.replace("\xa0", " ", regex=False).str.strip())
-        .drop_duplicates(subset=["BR_limpo"])
-        .set_index("BR_limpo")["I"]
-        .to_dict()
-    )
 
-    return fts_c_para_i, fts_br_para_i
+def ler_mapa_aux(sht_aux) -> dict:
+    """
+    Lê as colunas H e I da aba AUX e devolve um dicionário {H: I}.
+    Chamado UMA vez antes do loop — não lê o Excel linha por linha.
+    """
+    ultima_linha = sht_aux.range("H1").end("down").row
+    dados = sht_aux.range(f"H1:I{ultima_linha}").value
 
-
-def carregar_mapa_aux(sht_aux) -> dict:
-    """Reads H:I range from AUX sheet once and returns a {H_value: I_value} dict."""
-    ultima_linha = sht_aux.range("H" + str(sht_aux.cells.last_cell.row)).end("up").row
-    dados_hi = sht_aux.range(f"H1:I{ultima_linha}").value
-
-    if not dados_hi:
+    if not dados:
         return {}
 
-    # xlwings returns a flat list for a single row; wrap it
-    if isinstance(dados_hi[0], (str, int, float)) or dados_hi[0] is None:
-        dados_hi = [dados_hi]
+    # xlwings retorna lista simples quando há só 1 linha; normaliza para lista de listas
+    if isinstance(dados[0], (str, int, float)) or dados[0] is None:
+        dados = [dados]
 
     mapa = {}
-    for linha in dados_hi:
+    for linha in dados:
         if linha is None:
             continue
-        valor_h = linha[0] if len(linha) > 0 else None
-        valor_i = linha[1] if len(linha) > 1 else None
-        chave = limpar_texto(valor_h)
+        chave  = limpar_texto(linha[0]) if len(linha) > 0 else ""
+        valor  = linha[1]               if len(linha) > 1 else None
         if chave:
-            mapa[chave] = valor_i
+            mapa[chave] = valor
 
     return mapa
 
 
+def criar_mapas_fts(df_fts: pd.DataFrame):
+    """
+    Cria dois dicionários a partir da aba FTS:
+      - fts_c_para_i  : coluna C  → coluna I
+      - fts_br_para_i : coluna BR → coluna I
+    """
+    def montar_mapa(coluna: str) -> dict:
+        col_limpa = coluna + "_limpo"
+        return (
+            df_fts
+            .dropna(subset=[coluna])
+            .assign(**{
+                col_limpa: lambda x: (
+                    x[coluna].astype(str)
+                    .str.replace("\xa0", " ", regex=False)
+                    .str.strip()
+                )
+            })
+            .drop_duplicates(subset=[col_limpa])
+            .set_index(col_limpa)["I"]
+            .to_dict()
+        )
+
+    fts_c_para_i  = montar_mapa("C")
+    fts_br_para_i = montar_mapa("BR")
+
+    return fts_c_para_i, fts_br_para_i
+
+
+# =============================================================================
+# LÓGICA DE NEGÓCIO: montar código-base e traduzir Asset Name
+# =============================================================================
+
+def montar_codigo_base(linha) -> str:
+    """
+    Monta o código Bloomberg/padrão da linha conforme o tipo de produto.
+    Este valor é usado como fallback quando nenhuma tradução é encontrada.
+    """
+    produto = limpar_texto(linha["Product"])
+    asset   = limpar_texto(linha["Asset"])
+
+    if produto == "Ações":
+        return asset + " BZ EQUITY"
+
+    if produto == "Equity":
+        return asset + " EQUITY"
+
+    if produto == "Option":
+        return asset + " Equity"
+
+    if produto in PRODUTOS_OPCAO:   # demais variantes de opção brasileira
+        return asset
+
+    return asset
+
+
+def codigo_comeca_com_prefixo_especial(codigo: str) -> bool:
+    return limpar_texto(codigo).startswith(PREFIXOS_ESPECIAIS)
+
+
 def traduzir_asset_name(
     linha,
-    fts_c_para_i: dict,
+    fts_c_para_i:  dict,
     fts_br_para_i: dict,
-    mapa_aux: dict,
-    nome_coluna_swap: str = "AN",
+    mapa_aux:      dict,
 ) -> str:
-    produto = limpar_texto(linha["Product"])
-    codigo_base = montar_codigo_base(linha)
+    """
+    Decide o Asset Name de uma linha do MARS seguindo as prioridades:
 
-    # Options: try FTS lookups in priority order
+    Opções
+      1. Rating Description → busca em FTS (coluna C)
+      2. Trade ID (antes do '-') → busca em FTS (coluna BR)
+      3. Asset → busca em FTS (coluna C)
+      4. Fallback: código-base
+
+    Swap
+      1. Coluna AN → busca no mapa da aba AUX (H→I)
+      2. Fallback: código-base
+
+    Outros com prefixo especial (OFEQ, EQC…)
+      1. Código-base → busca em FTS (coluna C)
+      2. Fallback: código-base
+
+    Todos os demais
+      → código-base diretamente
+    """
+    produto      = limpar_texto(linha["Product"])
+    codigo_base  = montar_codigo_base(linha)
+
+    # --- Opções ---------------------------------------------------------------
     if produto in PRODUTOS_OPCAO:
-        chave_rating = limpar_texto(linha["Rating Description"])
-        if chave_rating in fts_c_para_i:
-            return fts_c_para_i[chave_rating]
 
-        chave_trade_id = tratar_trade_id(linha["Trade ID"])
-        if chave_trade_id in fts_br_para_i:
-            return fts_br_para_i[chave_trade_id]
+        # Prioridade 1: Rating Description → FTS C
+        chave = limpar_texto(linha["Rating Description"])
+        if chave in fts_c_para_i:
+            return fts_c_para_i[chave]
 
-        chave_asset = limpar_texto(linha["Asset"])
-        if chave_asset in fts_c_para_i:
-            return fts_c_para_i[chave_asset]
+        # Prioridade 2: Trade ID → FTS BR
+        chave = tratar_trade_id(linha["Trade ID"])
+        if chave in fts_br_para_i:
+            return fts_br_para_i[chave]
 
-        return codigo_base
+        # Prioridade 3: Asset → FTS C
+        chave = limpar_texto(linha["Asset"])
+        if chave in fts_c_para_i:
+            return fts_c_para_i[chave]
 
-    # Swap: look up in pre-built AUX dict
+        return codigo_base  # fallback
+
+    # --- Swap -----------------------------------------------------------------
     if produto in PRODUTOS_SWAP:
-        chave_swap = limpar_texto(linha.get(nome_coluna_swap, ""))
-        resultado = mapa_aux.get(chave_swap)
-        if _tem_valor(resultado):
+        chave     = limpar_texto(linha.get(COLUNA_SWAP, ""))
+        resultado = mapa_aux.get(chave)
+        if tem_valor(resultado):
             return resultado
-        return codigo_base
+        return codigo_base  # fallback
 
-    # Special prefixes: try FTS C lookup
-    if comeca_com_prefixo_especial(codigo_base):
-        chave_base = limpar_texto(codigo_base)
-        if chave_base in fts_c_para_i:
-            return fts_c_para_i[chave_base]
-        return codigo_base
+    # --- Prefixos especiais ---------------------------------------------------
+    if codigo_comeca_com_prefixo_especial(codigo_base):
+        chave = limpar_texto(codigo_base)
+        if chave in fts_c_para_i:
+            return fts_c_para_i[chave]
+        return codigo_base  # fallback
 
+    # --- Todos os demais ------------------------------------------------------
     return codigo_base
 
 
+# =============================================================================
+# PONTO DE ENTRADA — chamado pelo VBA via RunPython
+# =============================================================================
+
 def atualizar_asset_name():
-    global df_mars, df_fts
-
+    """
+    Função principal chamada pelo VBA.
+    Lê os dados do Excel, calcula o Asset Name e grava de volta na aba MARS.
+    """
     wb = xw.Book.caller()
-    sht_mars = wb.sheets["MARS"]
-    sht_aux = wb.sheets["AUX"]
 
+    # 1. Abrir as abas
+    sht_mars = wb.sheets[ABA_MARS]
+    sht_fts  = wb.sheets[ABA_FTS]
+    sht_aux  = wb.sheets[ABA_AUX]
+
+    # 2. Ler os dados
+    df_mars  = ler_dataframe_da_aba(sht_mars)
+    df_fts   = ler_dataframe_da_aba(sht_fts)
+    mapa_aux = ler_mapa_aux(sht_aux)
+
+    # 3. Montar os dicionários de tradução da FTS
     fts_c_para_i, fts_br_para_i = criar_mapas_fts(df_fts)
-    mapa_aux = carregar_mapa_aux(sht_aux)
 
+    # 4. Calcular o Asset Name linha a linha
     df_mars["Asset Name"] = df_mars.apply(
         lambda linha: traduzir_asset_name(
-            linha=linha,
-            fts_c_para_i=fts_c_para_i,
-            fts_br_para_i=fts_br_para_i,
-            mapa_aux=mapa_aux,
-            nome_coluna_swap="AN",
+            linha          = linha,
+            fts_c_para_i   = fts_c_para_i,
+            fts_br_para_i  = fts_br_para_i,
+            mapa_aux       = mapa_aux,
         ),
         axis=1,
     )
 
-    col_asset_name = df_mars.columns.get_loc("Asset Name") + 1
-    sht_mars.range((2, col_asset_name)).options(transpose=True).value = df_mars["Asset Name"].tolist()
+    # 5. Gravar a coluna de volta no Excel (a partir da linha 2, abaixo do cabeçalho)
+    col_idx = df_mars.columns.get_loc("Asset Name") + 1
+    sht_mars.range((2, col_idx)).options(transpose=True).value = df_mars["Asset Name"].tolist()
 
-    print("Asset Name atualizado com sucesso.")
+    print("✓ Asset Name atualizado com sucesso.")
