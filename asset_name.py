@@ -6,14 +6,9 @@ import xlwings as xw
 # =============================================================================
 
 ABA_MARS = "MARS"          # Aba com os dados principais
-ABA_FTS  = "FTS"           # Aba com a tabela de tradução (colunas C, BR, I)
 ABA_AUX  = "AUX"           # Aba auxiliar com mapa de Swap (colunas H e I)
 
 COLUNA_SWAP = "AN"         # Coluna em MARS usada como chave para Swap
-
-# Linha onde começa o cabeçalho em cada aba (1 = primeira linha)
-LINHA_CABECALHO_MARS = 1
-LINHA_CABECALHO_FTS  = 1
 
 # =============================================================================
 # TIPOS DE PRODUTO — edite aqui se surgir novo nome de produto
@@ -65,16 +60,6 @@ def tratar_trade_id(valor) -> str:
 # =============================================================================
 # LEITURA DOS DADOS DO EXCEL
 # =============================================================================
-
-def ler_dataframe_da_aba(aba) -> pd.DataFrame:
-    """Lê a aba inteira como DataFrame (cabeçalho na primeira linha)."""
-    return (
-        aba
-        .range("A1")
-        .options(pd.DataFrame, expand="table", header=1)
-        .value
-    )
-
 
 def ler_mapa_aux(sht_aux) -> dict:
     """
@@ -238,22 +223,22 @@ def traduzir_asset_name(
 def atualizar_asset_name():
     """
     Função principal chamada pelo VBA.
-    Lê os dados do Excel, calcula o Asset Name e grava de volta na aba MARS.
+    Usa df_mars e df_fts já carregados no arquivo principal (globals).
+    Calcula o Asset Name e grava de volta na aba MARS.
     """
+    global df_mars, df_fts   # definidos e carregados no arquivo principal
+
     wb = xw.Book.caller()
 
-    # 1. Abrir as abas
+    # 1. Abrir as abas necessárias
     sht_mars = wb.sheets[ABA_MARS]
-    sht_fts  = wb.sheets[ABA_FTS]
     sht_aux  = wb.sheets[ABA_AUX]
 
-    # 2. Ler os dados
-    df_mars  = ler_dataframe_da_aba(sht_mars)
-    df_fts   = ler_dataframe_da_aba(sht_fts)
-    mapa_aux = ler_mapa_aux(sht_aux)
-
-    # 3. Montar os dicionários de tradução da FTS
+    # 2. Montar dicionários de tradução a partir do df_fts já carregado
     fts_c_para_i, fts_br_para_i = criar_mapas_fts(df_fts)
+
+    # 3. Ler aba AUX uma única vez e montar dicionário para Swap
+    mapa_aux = ler_mapa_aux(sht_aux)
 
     # 4. Calcular o Asset Name linha a linha
     df_mars["Asset Name"] = df_mars.apply(
